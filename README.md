@@ -152,4 +152,3 @@ MIT
 ## Credits
 
 - **Farzan Karimi** — [Castling Security](https://castlingsecurity.com)
-- Web Predator research — DEFCON
