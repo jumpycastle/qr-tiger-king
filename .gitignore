@@ -1,0 +1,9 @@
+qr_king_*/
+qr_wide_net_*/
+qr_http_results_*/
+results_*/
+venv/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
