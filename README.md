@@ -13,8 +13,7 @@ This tool automates the full pipeline: DNS reconnaissance → CNAME discovery �
 ## How It Works
 
 1. **DNS Scan** — Queries `qr.<domain>` for CNAME records across up to 1M domains in parallel
-2. **CNAME Match** — Flags any CNAME pointing to `qr1.be` (QR Tiger infrastructure)
-3. **HTTP Verify** — Curls each hit to classify as:
+2. **Inline HTTP Verify** — As each CNAME → `qr1.be` hit is found, immediately curls it to classify as:
    - **UNCLAIMED** — Returns `Forbidden` (claimable in QR Tiger's dashboard)
    - **CLAIMED** — Serves content or redirects (already owned by someone)
 
@@ -22,7 +21,7 @@ This tool automates the full pipeline: DNS reconnaissance → CNAME discovery �
 
 ```bash
 # Clone
-git clone https://github.com/YOUR_USER/qr-tiger-king.git
+git clone https://github.com/jumpycastle/qr-tiger-king.git
 cd qr-tiger-king
 
 # Install dependencies

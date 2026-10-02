@@ -7,9 +7,9 @@ DEFCON / Web Predator Research
 Single script that:
   1. Downloads domain lists (Tranco 1M, Majestic, Umbrella, or your own)
   2. Runs parallel DNS lookups for qr.<domain> CNAME → qr1.be
-  3. HTTP-checks each hit to classify as:
-       UNCLAIMED (Forbidden/404/error → claimable in QR Tiger)
-       CLAIMED   (serving content → someone already owns it)
+     → Immediately HTTP-checks each hit inline to classify as:
+         UNCLAIMED (Forbidden/404/error → claimable in QR Tiger)
+         CLAIMED   (serving content → someone already owns it)
 
 Usage:
   python3 qr_tiger_king.py                          # Tranco 1M, full scan
@@ -20,7 +20,7 @@ Usage:
   python3 qr_tiger_king.py --threads 100            # Adjust parallelism
   python3 qr_tiger_king.py --dns-only               # Skip HTTP check
 
-Requirements: Python 3.7+, dnspython (pip install dnspython), requests
+Requirements: Python 3.7+, dnspython, requests, tqdm (pip install dnspython requests tqdm)
 """
 
 import argparse
@@ -48,6 +48,12 @@ try:
 except ImportError:
     print("Error: requests not installed. Run: pip install requests")
     sys.exit(1)
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 
 # ──────────────────────────────────────────────────────────────
@@ -278,12 +284,13 @@ def main():
     # ── Banner ──
     print(f"\n{C.BOLD}{C.CYAN}")
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║          QR Tiger King — Integrated Takeover Scanner         ║")
-    print("║          DNS Scan + HTTP Verification in One Pass            ║")
+    print("║          🐅  QR Tiger King  👑                              ║")
+    print("║          Integrated Subdomain Takeover Scanner              ║")
+    print("║          DNS Scan + HTTP Verification in One Pass           ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print(f"{C.NC}")
     print(f"  Threads: {C.BOLD}{args.threads}{C.NC}")
-    mode_label = "DNS only" if args.dns_only else "DNS + HTTP"
+    mode_label = "DNS only" if args.dns_only else "DNS + HTTP (inline)"
     print(f"  Mode:    {C.BOLD}{mode_label}{C.NC}\n")
 
     # ── Setup output dir ──
@@ -291,9 +298,13 @@ def main():
     work_dir = Path(f"./qr_king_{timestamp}")
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    raw_dir = work_dir / "raw_responses"
+    raw_dir.mkdir(exist_ok=True)
+
     # ── Step 1: Get domains ──
+    steps = "2" if args.dns_only else "2"
     if args.scan_file:
-        print(f"{C.BOLD}[Step 1/3] Loading domain list: {args.scan_file}{C.NC}")
+        print(f"{C.BOLD}[Step 1/{steps}] Loading domain list: {args.scan_file}{C.NC}")
         domains = [
             line.strip() for line in Path(args.scan_file).read_text().splitlines()
             if line.strip() and not line.strip().startswith("#")
@@ -310,7 +321,7 @@ def main():
                 clean.append(d)
         domains = clean
     else:
-        print(f"{C.BOLD}[Step 1/3] Downloading domain list: {args.source}...{C.NC}")
+        print(f"{C.BOLD}[Step 1/{steps}] Downloading domain list: {args.source}...{C.NC}")
         domains = download_domains(args.source, work_dir)
 
     print(f"  {C.GREEN}Loaded {len(domains)} unique domains{C.NC}")
@@ -332,151 +343,215 @@ def main():
     # Save domain list
     (work_dir / "domains.txt").write_text("\n".join(domains) + "\n")
 
-    # ── Step 2: Parallel DNS scan ──
-    print(f"\n{C.BOLD}[Step 2/3] Scanning qr.<domain> for QR Tiger CNAMEs...{C.NC}\n")
+    # ── Step 2: DNS scan (+ inline HTTP verification) ──
+    scan_label = "DNS scan" if args.dns_only else "DNS scan + HTTP verification"
+    print(f"\n{C.BOLD}[Step 2/{steps}] {scan_label}...{C.NC}\n")
 
-    vulnerable = []   # CNAME → qr1.be
+    vulnerable = []   # CNAME → qr1.be (DNS hits)
+    unclaimed = []    # HTTP verified: claimable
+    claimed = []      # HTTP verified: already taken
     has_qr = []       # qr.* resolves to something else
     no_record = []    # no DNS record
 
-    progress_lock = Lock()
-    scanned = [0]
+    results_lock = Lock()
     start_time = time.time()
 
-    def dns_worker(domain):
-        result = check_dns(domain)
-        with progress_lock:
-            scanned[0] += 1
-            count = scanned[0]
-            if count % 500 == 0:
-                pct = count * 100 // total
-                print(
-                    f"  {C.CYAN}[{count}/{total}] {pct}%  |  "
-                    f"CNAME hits: {len(vulnerable)}  |  "
-                    f"qr.* exists: {len(has_qr)}{C.NC}",
-                    file=sys.stderr
-                )
-        return result
+    # Open CSV writers upfront for incremental writing
+    vuln_csv_f = open(work_dir / "vulnerable_dns.csv", "w", newline="")
+    vuln_csv = csv.writer(vuln_csv_f)
+    vuln_csv.writerow(["domain", "qr_subdomain", "cname_target"])
+
+    has_qr_csv_f = open(work_dir / "has_qr_subdomain.csv", "w", newline="")
+    has_qr_csv = csv.writer(has_qr_csv_f)
+    has_qr_csv.writerow(["domain", "qr_subdomain", "record_type", "value"])
+
+    no_record_f = open(work_dir / "no_record.txt", "w")
+
+    if not args.dns_only:
+        unclaimed_csv_f = open(work_dir / "unclaimed.csv", "w", newline="")
+        unclaimed_csv = csv.writer(unclaimed_csv_f)
+        unclaimed_csv.writerow(["domain", "qr_subdomain", "cname_target", "http_status"])
+
+        claimed_csv_f = open(work_dir / "claimed.csv", "w", newline="")
+        claimed_csv = csv.writer(claimed_csv_f)
+        claimed_csv.writerow(["domain", "qr_subdomain", "cname_target", "http_status", "snippet"])
+
+        full_csv_f = open(work_dir / "full_results.csv", "w", newline="")
+        full_csv = csv.writer(full_csv_f)
+        full_csv.writerow(["domain", "qr_subdomain", "cname_target", "http_status",
+                           "category", "snippet"])
 
     with ThreadPoolExecutor(max_workers=args.threads) as pool:
-        futures = {pool.submit(dns_worker, d): d for d in domains}
-        for future in as_completed(futures):
+        futures = {pool.submit(check_dns, d): d for d in domains}
+
+        # Use tqdm if available, otherwise fall back to periodic prints
+        if HAS_TQDM:
+            pbar = tqdm(
+                as_completed(futures),
+                total=total,
+                desc="  Scanning",
+                unit="dom",
+                bar_format=(
+                    "{l_bar}{bar}| {n_fmt}/{total_fmt} "
+                    "[{elapsed}<{remaining}, {rate_fmt}]"
+                ),
+                colour="cyan",
+                ncols=90,
+            )
+            iterator = pbar
+        else:
+            iterator = as_completed(futures)
+            _fallback_count = [0]
+
+        for future in iterator:
             try:
                 result = future.result()
-                if result["type"] == "vulnerable":
-                    vulnerable.append(result)
-                    print(
-                        f"  {C.RED}⚠  CNAME HIT: {result['qr_domain']}  →  "
-                        f"{result['value']}{C.NC}"
-                    )
-                elif result["type"] == "has_qr":
-                    has_qr.append(result)
+                with results_lock:
+                    if result["type"] == "vulnerable":
+                        vulnerable.append(result)
+                        vuln_csv.writerow([result["domain"], result["qr_domain"], result["value"]])
+                        vuln_csv_f.flush()
+
+                        if args.dns_only:
+                            # DNS-only mode: just report the CNAME hit
+                            hit_msg = (
+                                f"{C.RED}⚠  CNAME HIT: {result['qr_domain']}  →  "
+                                f"{result['value']}{C.NC}"
+                            )
+                            if HAS_TQDM:
+                                tqdm.write(f"  {hit_msg}")
+                            else:
+                                print(f"  {hit_msg}")
+                        else:
+                            # Inline HTTP check immediately
+                            http_result = check_http(
+                                result["domain"], result["qr_domain"],
+                                result["value"], raw_dir
+                            )
+                            cat = http_result["category"]
+                            status = http_result["http_status"]
+
+                            # Write to CSVs
+                            full_csv.writerow([
+                                http_result["domain"], http_result["qr_domain"],
+                                http_result["cname_target"], http_result["http_status"],
+                                http_result["category"], http_result["snippet"][:200]
+                            ])
+                            full_csv_f.flush()
+
+                            if cat == "UNCLAIMED":
+                                unclaimed.append(http_result)
+                                unclaimed_csv.writerow([
+                                    http_result["domain"], http_result["qr_domain"],
+                                    http_result["cname_target"], http_result["http_status"]
+                                ])
+                                unclaimed_csv_f.flush()
+
+                                reason = ("Forbidden body" if status == 200 else
+                                          f"{status} Forbidden" if status == 403 else
+                                          f"{status} Not Found" if status == 404 else
+                                          "connection failed" if status == 0 else
+                                          f"{status} error content")
+                                msg = (
+                                    f"  {C.GREEN}✅ UNCLAIMED: {result['qr_domain']}  →  "
+                                    f"{result['value']}  ({reason}){C.NC}"
+                                )
+                            elif cat == "CLAIMED":
+                                claimed.append(http_result)
+                                claimed_csv.writerow([
+                                    http_result["domain"], http_result["qr_domain"],
+                                    http_result["cname_target"], http_result["http_status"],
+                                    http_result["snippet"][:200]
+                                ])
+                                claimed_csv_f.flush()
+
+                                kind = "redirect" if 300 <= status < 400 else "serving content"
+                                msg = (
+                                    f"  {C.RED}🔒 CLAIMED: {result['qr_domain']}  →  "
+                                    f"{result['value']}  ({status} {kind}){C.NC}"
+                                )
+                            else:
+                                msg = (
+                                    f"  {C.YELLOW}❓ UNKNOWN: {result['qr_domain']}  →  "
+                                    f"{result['value']}  (HTTP {status}){C.NC}"
+                                )
+
+                            if HAS_TQDM:
+                                tqdm.write(msg)
+                            else:
+                                print(msg)
+
+                    elif result["type"] == "has_qr":
+                        has_qr.append(result)
+                        has_qr_csv.writerow([
+                            result["domain"], result["qr_domain"],
+                            result["record_type"], result["value"]
+                        ])
+                        has_qr_csv_f.flush()
+                    else:
+                        no_record.append(result)
+                        no_record_f.write(result["domain"] + "\n")
+
+                # Update tqdm postfix with live stats
+                if HAS_TQDM:
+                    if args.dns_only:
+                        pbar.set_postfix_str(
+                            f"hits={len(vulnerable)}  qr.*={len(has_qr)}",
+                            refresh=False,
+                        )
+                    else:
+                        pbar.set_postfix_str(
+                            f"hits={len(vulnerable)}  "
+                            f"unclaimed={len(unclaimed)}  "
+                            f"claimed={len(claimed)}",
+                            refresh=False,
+                        )
                 else:
-                    no_record.append(result)
-            except Exception as e:
+                    _fallback_count[0] += 1
+                    if _fallback_count[0] % 500 == 0:
+                        pct = _fallback_count[0] * 100 // total
+                        if args.dns_only:
+                            print(
+                                f"  {C.CYAN}[{_fallback_count[0]}/{total}] {pct}%  |  "
+                                f"CNAME hits: {len(vulnerable)}  |  "
+                                f"qr.* exists: {len(has_qr)}{C.NC}",
+                                file=sys.stderr,
+                            )
+                        else:
+                            print(
+                                f"  {C.CYAN}[{_fallback_count[0]}/{total}] {pct}%  |  "
+                                f"hits: {len(vulnerable)}  |  "
+                                f"unclaimed: {len(unclaimed)}  |  "
+                                f"claimed: {len(claimed)}{C.NC}",
+                                file=sys.stderr,
+                            )
+
+            except Exception:
                 pass  # DNS errors are non-fatal
 
-    dns_elapsed = time.time() - start_time
+        if HAS_TQDM:
+            pbar.close()
 
-    print(f"\n{C.BOLD}{C.CYAN}── DNS Scan Complete ──{C.NC}")
-    print(f"  Domains scanned:    {C.BOLD}{scanned[0]}{C.NC}")
-    print(f"  Time:               {C.BOLD}{int(dns_elapsed // 60)}m {int(dns_elapsed % 60)}s{C.NC}")
-    print(f"  {C.RED}CNAME → qr1.be:     {C.BOLD}{len(vulnerable)}{C.NC}")
-    print(f"  {C.YELLOW}qr.* exists (other): {C.BOLD}{len(has_qr)}{C.NC}")
-    print(f"  No qr.* record:     {C.BOLD}{len(no_record)}{C.NC}\n")
+    # Close all CSV files
+    vuln_csv_f.close()
+    has_qr_csv_f.close()
+    no_record_f.close()
+    if not args.dns_only:
+        unclaimed_csv_f.close()
+        claimed_csv_f.close()
+        full_csv_f.close()
 
-    # Write DNS results
-    with open(work_dir / "vulnerable_dns.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["domain", "qr_subdomain", "cname_target"])
-        for v in vulnerable:
-            w.writerow([v["domain"], v["qr_domain"], v["value"]])
-
-    with open(work_dir / "has_qr_subdomain.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["domain", "qr_subdomain", "record_type", "value"])
-        for h in has_qr:
-            w.writerow([h["domain"], h["qr_domain"], h["record_type"], h["value"]])
-
-    (work_dir / "no_record.txt").write_text(
-        "\n".join(r["domain"] for r in no_record) + "\n"
-    )
-
-    # ── Step 3: HTTP verification ──
-    unclaimed = []
-    claimed = []
-
-    if args.dns_only:
-        print(f"{C.YELLOW}Skipping HTTP check (--dns-only).{C.NC}")
-    elif not vulnerable:
-        print(f"{C.GREEN}No CNAME hits to HTTP-check. Done.{C.NC}")
-    else:
-        print(f"{C.BOLD}[Step 3/3] HTTP-checking {len(vulnerable)} CNAME hits...{C.NC}\n")
-
-        raw_dir = work_dir / "raw_responses"
-        raw_dir.mkdir(exist_ok=True)
-
-        for i, v in enumerate(vulnerable, 1):
-            domain = v["domain"]
-            qr_domain = v["qr_domain"]
-            cname = v["value"]
-
-            print(f"  {C.CYAN}[{i}/{len(vulnerable)}]{C.NC} {qr_domain:<50}", end="")
-
-            http_result = check_http(domain, qr_domain, cname, raw_dir)
-
-            cat = http_result["category"]
-            status = http_result["http_status"]
-
-            if cat == "UNCLAIMED":
-                unclaimed.append(http_result)
-                reason = "Forbidden body" if status == 200 else \
-                         f"{status} Forbidden" if status == 403 else \
-                         f"{status} Not Found" if status == 404 else \
-                         "connection failed" if status == 0 else \
-                         f"{status} error content"
-                print(f" {C.GREEN}→ UNCLAIMED ({reason}){C.NC}")
-            elif cat == "CLAIMED":
-                claimed.append(http_result)
-                kind = "redirect" if 300 <= status < 400 else "serving content"
-                print(f" {C.RED}→ CLAIMED ({status} {kind}){C.NC}")
-            else:
-                print(f" {C.YELLOW}→ UNKNOWN (HTTP {status}){C.NC}")
-
-            time.sleep(0.2)
-
-        # Write HTTP results
-        with open(work_dir / "unclaimed.csv", "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["domain", "qr_subdomain", "cname_target", "http_status"])
-            for u in unclaimed:
-                w.writerow([u["domain"], u["qr_domain"], u["cname_target"], u["http_status"]])
-
-        with open(work_dir / "claimed.csv", "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["domain", "qr_subdomain", "cname_target", "http_status", "snippet"])
-            for c in claimed:
-                w.writerow([c["domain"], c["qr_domain"], c["cname_target"],
-                            c["http_status"], c["snippet"][:200]])
-
-        with open(work_dir / "full_results.csv", "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["domain", "qr_subdomain", "cname_target", "http_status",
-                         "category", "snippet"])
-            for r in unclaimed + claimed:
-                w.writerow([r["domain"], r["qr_domain"], r["cname_target"],
-                            r["http_status"], r["category"], r["snippet"][:200]])
-
-    # ── Summary ──
     total_elapsed = time.time() - start_time
 
+    # ── Summary ──
     print(f"\n{C.BOLD}{C.CYAN}═══════════════════════════════════════════════════════{C.NC}")
     print(f"{C.BOLD}                    SCAN COMPLETE                       {C.NC}")
     print(f"{C.BOLD}{C.CYAN}═══════════════════════════════════════════════════════{C.NC}\n")
 
     source_label = args.scan_file if args.scan_file else args.source
+    scanned_count = len(vulnerable) + len(has_qr) + len(no_record)
     print(f"  Source:                {C.BOLD}{source_label}{C.NC}")
-    print(f"  Domains scanned:       {C.BOLD}{scanned[0]}{C.NC}")
+    print(f"  Domains scanned:       {C.BOLD}{scanned_count}{C.NC}")
     print(f"  Total time:            {C.BOLD}{int(total_elapsed // 60)}m {int(total_elapsed % 60)}s{C.NC}")
     print(f"  Threads:               {C.BOLD}{args.threads}{C.NC}\n")
 
@@ -532,3 +607,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
