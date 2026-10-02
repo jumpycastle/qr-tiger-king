@@ -1,4 +1,4 @@
-# QR Tiger King 👑
+# 🐅 QR Tiger King 👑
 
 **Integrated QR Tiger Subdomain Takeover Scanner**
 
