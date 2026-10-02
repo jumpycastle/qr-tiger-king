@@ -6,8 +6,6 @@ Discover domains vulnerable to subdomain takeover via [QR Tiger's](https://www.q
 
 This tool automates the full pipeline: DNS reconnaissance → CNAME discovery → HTTP verification.
 
-Built for the **Web Predator** DEFCON research by [Castling Security](https://castlingsecurity.com).
-
 📝 **Full write-up:** [Introducing QR Jacking — When Your Branded QR Codes Aren't Yours](https://jumpycastle.dev/introducing-qr-jacking-when-your-branded-qr-codes-arent-yours-b3621cdfac1f)
 
 ---
